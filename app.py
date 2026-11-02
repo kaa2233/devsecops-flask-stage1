@@ -1,4 +1,4 @@
-"""A small Flask TODO API used for the DevSecOps Stage 1 pipeline."""
+"""A small Flask TODO API used for the DevSecOps pipeline."""
 
 import os
 
@@ -7,6 +7,37 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 # In-memory storage keeps this starter project simple for CI exercises.
+todos = []
+next_id = 1
+
+
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to every HTTP response."""
+
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'; "
+        "form-action 'none'"
+    )
+
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=()"
+    )
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    response.headers["X-Frame-Options"] = "DENY"
+
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+    return response
+
+
+# In-memory storage
 todos = []
 next_id = 1
 
@@ -67,7 +98,6 @@ def delete_todo(todo_id):
 
 
 if __name__ == "__main__":  # pragma: no cover
-    # Bind to loopback by default; the container sets FLASK_HOST explicitly.
     app.run(
         host=os.environ.get("FLASK_HOST", "127.0.0.1"),
         port=int(os.environ.get("PORT", "5000")),
