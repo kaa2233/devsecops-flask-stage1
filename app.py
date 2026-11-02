@@ -6,6 +6,28 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
+
+class HideServerHeader:
+    """Remove server identification from HTTP responses."""
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        def custom_start_response(status, headers, exc_info=None):
+            headers = [
+                (name, value)
+                for name, value in headers
+                if name.lower() != "server"
+            ]
+            return start_response(status, headers, exc_info)
+
+        return self.wsgi_app(environ, custom_start_response)
+
+
+app.wsgi_app = HideServerHeader(app.wsgi_app)
+
+
 # In-memory storage keeps this starter project simple for CI exercises.
 todos = []
 next_id = 1
@@ -35,11 +57,6 @@ def add_security_headers(response):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
 
     return response
-
-
-# In-memory storage
-todos = []
-next_id = 1
 
 
 @app.get("/")
