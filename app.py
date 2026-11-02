@@ -3,29 +3,16 @@
 import os
 
 from flask import Flask, jsonify, request
+from werkzeug.serving import WSGIRequestHandler
 
 app = Flask(__name__)
 
 
-class HideServerHeader:
-    """Remove server identification from HTTP responses."""
+class CustomRequestHandler(WSGIRequestHandler):
+    """Hide server version information."""
 
-    def __init__(self, wsgi_app):
-        self.wsgi_app = wsgi_app
-
-    def __call__(self, environ, start_response):
-        def custom_start_response(status, headers, exc_info=None):
-            headers = [
-                (name, value)
-                for name, value in headers
-                if name.lower() != "server"
-            ]
-            return start_response(status, headers, exc_info)
-
-        return self.wsgi_app(environ, custom_start_response)
-
-
-app.wsgi_app = HideServerHeader(app.wsgi_app)
+    def version_string(self):
+        return ""
 
 
 # In-memory storage keeps this starter project simple for CI exercises.
@@ -118,4 +105,5 @@ if __name__ == "__main__":  # pragma: no cover
     app.run(
         host=os.environ.get("FLASK_HOST", "127.0.0.1"),
         port=int(os.environ.get("PORT", "5000")),
+        request_handler=CustomRequestHandler,
     )
