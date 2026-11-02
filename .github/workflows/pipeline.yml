@@ -118,8 +118,11 @@ jobs:
       - pylint
       - pip-audit
       - pytest
+    outputs:
+      security_score: ${{ steps.calculate.outputs.security_score }}
     steps:
       - name: Calculate and publish score
+        id: calculate
         env:
           GITLEAKS: ${{ needs.gitleaks.result }}
           SEMGREP: ${{ needs.semgrep.result }}
@@ -141,8 +144,13 @@ jobs:
               "pip-audit": os.environ["PIP_AUDIT"],
               "pytest": os.environ["PYTEST"],
           }
+
           passed = sum(result == "success" for result in checks.values())
           score = round((passed / len(checks)) * 100)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"security_score={score}\n")
+
           lines = [
               "## Stage 1 Security & Quality Summary",
               "",
@@ -151,13 +159,46 @@ jobs:
               "| Check | Result |",
               "|---|---|",
           ]
+
           for name, result in checks.items():
               icon = "✅" if result == "success" else "❌"
               lines.append(f"| {name} | {icon} `{result}` |")
+
           lines.extend([
               "",
-              "> Stage 1 reports the score. The PR score gate (for example, threshold >= 80) is planned for Stage 2.",
+              "> Stage 2 Security Gate requires a minimum security score of 80/100.",
           ])
+
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("\n".join(lines) + "\n")
           PY
+
+  security-gate:
+    name: Stage 2 - Security Gate
+    runs-on: ubuntu-latest
+    needs:
+      - stage1-summary
+    steps:
+      - name: Evaluate Security Score
+        env:
+          SECURITY_SCORE: ${{ needs.stage1-summary.outputs.security_score }}
+        run: |
+          echo "=================================="
+          echo "       STAGE 2 SECURITY GATE"
+          echo "=================================="
+          echo "Security Score: ${SECURITY_SCORE}/100"
+          echo "Minimum Required: 80/100"
+
+          if [ -z "$SECURITY_SCORE" ]; then
+            echo "ERROR: Security score is missing."
+            exit 1
+          fi
+
+          if [ "$SECURITY_SCORE" -ge 80 ]; then
+            echo "RESULT: SECURITY GATE PASSED"
+            echo "Pipeline is allowed to continue."
+          else
+            echo "RESULT: SECURITY GATE FAILED"
+            echo "Pipeline is blocked because the score is below 80."
+            exit 1
+          fi
