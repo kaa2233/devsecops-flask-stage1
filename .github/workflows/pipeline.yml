@@ -1,4 +1,3 @@
-
 name: DevSecOps Pipeline
 
 on:
@@ -313,24 +312,226 @@ jobs:
 
       - name: Tag and push image
         env:
-          IMAGE_NAME: ghcr.io/${{ github.repository }}:stage3
+          IMAGE_STAGE3: ghcr.io/${{ github.repository }}:stage3
+          IMAGE_SHA: ghcr.io/${{ github.repository }}:${{ github.sha }}
         run: |
-          docker tag devsecops-flask:stage3 "$IMAGE_NAME"
-          docker push "$IMAGE_NAME"
+          docker tag devsecops-flask:stage3 "$IMAGE_STAGE3"
+          docker tag devsecops-flask:stage3 "$IMAGE_SHA"
+          docker push "$IMAGE_STAGE3"
+          docker push "$IMAGE_SHA"
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3.8.2
 
       - name: Sign image with Cosign
         env:
-          IMAGE_NAME: ghcr.io/${{ github.repository }}:stage3
+          IMAGE_SHA: ghcr.io/${{ github.repository }}:${{ github.sha }}
         run: |
-          cosign sign --yes "$IMAGE_NAME"
+          cosign sign --yes "$IMAGE_SHA"
 
       - name: Verify image signature
         env:
-          IMAGE_NAME: ghcr.io/${{ github.repository }}:stage3
+          IMAGE_SHA: ghcr.io/${{ github.repository }}:${{ github.sha }}
         run: |
-          cosign verify "$IMAGE_NAME" \
+          cosign verify "$IMAGE_SHA" \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/.*" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+  deploy-staging:
+    name: Stage 4 - Deploy Staging
+    runs-on: [self-hosted, Linux, X64]
+    needs: cosign-sign
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.8.2
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+
+      - name: Verify signed image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+        run: |
+          cosign verify "$IMAGE" \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+      - name: Pull signed image
+        run: |
+          docker pull ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Deploy staging container
+        run: |
+          docker rm -f flask-staging || true
+          docker run -d \
+            --name flask-staging \
+            --restart unless-stopped \
+            -p 5000:5000 \
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Staging health check
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5000/; then
+              echo "Staging health check PASSED"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs flask-staging
+          exit 1
+
+      - name: Logout from GHCR
+        if: always()
+        run: docker logout ghcr.io || true
+
+  zap-dast:
+    name: Stage 4 - OWASP ZAP DAST
+    runs-on: [self-hosted, Linux, X64]
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Prepare report directory
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/zap-results"
+
+      - name: Run OWASP ZAP Baseline Scan
+        run: |
+          docker run --rm \
+            --network host \
+            -v "$GITHUB_WORKSPACE/zap-results:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t http://127.0.0.1:5000 \
+            -r zap-report.html \
+            -I
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage4-zap-report
+          path: zap-results/zap-report.html
+          if-no-files-found: warn
+          retention-days: 30
+
+  deploy-production:
+    name: Stage 4 - Production Deployment
+    runs-on: [self-hosted, Linux, X64]
+    needs: zap-dast
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.8.2
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+
+      - name: Verify production image signature
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+        run: |
+          cosign verify "$IMAGE" \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+      - name: Pull release image
+        run: |
+          docker pull ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Deploy production with automatic rollback
+        shell: bash
+        run: |
+          set -e
+
+          IMAGE="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          HAD_PREVIOUS=false
+
+          echo "Preparing production deployment..."
+
+          # Remove an obsolete backup container.
+          if docker container inspect flask-production-previous >/dev/null 2>&1; then
+            docker rm -f flask-production-previous
+          fi
+
+          # Preserve the currently running production container.
+          if docker container inspect flask-production >/dev/null 2>&1; then
+            docker stop flask-production
+            docker rename flask-production flask-production-previous
+            HAD_PREVIOUS=true
+          fi
+
+          # Start the new production version.
+          if ! docker run -d \
+            --name flask-production \
+            --restart unless-stopped \
+            -p 5001:5000 \
+            "$IMAGE"; then
+
+            echo "New deployment failed. Starting rollback..."
+
+            docker rm -f flask-production || true
+
+            if [ "$HAD_PREVIOUS" = true ]; then
+              docker rename flask-production-previous flask-production
+              docker start flask-production
+              echo "Previous production version restored."
+            fi
+
+            exit 1
+          fi
+
+          # Check application health.
+          HEALTHY=false
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5001/; then
+              HEALTHY=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$HEALTHY" = true ]; then
+            echo "Production health check PASSED"
+
+            if [ "$HAD_PREVIOUS" = true ]; then
+              docker rm -f flask-production-previous
+            fi
+
+            echo "Production deployment successful."
+          else
+            echo "Production health check FAILED."
+            echo "Starting automatic rollback..."
+
+            docker logs flask-production || true
+            docker rm -f flask-production || true
+
+            if [ "$HAD_PREVIOUS" = true ]; then
+              docker rename flask-production-previous flask-production
+              docker start flask-production
+              echo "Previous production version restored."
+            else
+              echo "No previous production version was available."
+            fi
+
+            exit 1
+          fi
+
+      - name: Logout from GHCR
+        if: always()
+        run: docker logout ghcr.io || true
